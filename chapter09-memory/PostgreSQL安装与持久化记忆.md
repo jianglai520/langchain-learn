@@ -3,6 +3,23 @@
 > 这份文档记录的是本机真实安装过程，包含踩过的坑和排查方法。
 > 目标不是"照着敲一遍能跑"，而是"知道每一步为什么这么做、出问题该往哪看"。
 
+## 目录
+
+| 章 | 内容 | 什么时候看 |
+|---|---|---|
+| 一 | 为什么需要 PostgreSQL | 第一次读，建立概念 |
+| 二 | 三种装法的取舍 | 换机器重装时 |
+| 三 | Docker 四个核心概念 | 不懂 `-p` / `-v` 时 |
+| 四 | 安装全流程 | 照着做 |
+| 五 | LangChain 代码改造 | 改 notebook 时 |
+| 六 | 五个真实坑的复盘 | 报错了先查这里 |
+| 七 | 数据存成了什么（四张表） | 想搞懂 checkpoint 原理 |
+| 八 | **怎么查看持久化数据** | 想看库里有什么 |
+| 九 | 四个持久化实验 | 动手验证，最重要 |
+| 十 | 排错手册 | 按症状查 |
+| 十一 | 日常运维命令 | 平时用 |
+| 十二 | 速查卡片 | 忘了就翻 |
+
 ## 环境快照
 
 | 项 | 值 |
@@ -874,31 +891,320 @@ with PostgresSaver.from_conn_string(DB_URI) as cp:
     cp.delete_thread("probe")
 ```
 
-### 7.4 实测 SQL
+## 八、查看持久化数据
+
+### 8.1 三层，别混在一起
+
+排查和学习时最常犯的错误是"想用一个 SQL 看到所有东西"。实际要分三层：
+
+| 层 | 看什么 | 用什么 | 能否直接读懂 |
+|---|---|---|---|
+| 结构 | 有哪些表、字段、索引 | `\dt` / `\d+` / `information_schema` | ✅ |
+| 元数据 | 几个会话、几步、父子链、blob 大小 | 纯 SQL | ✅ 明文 |
+| 内容 | 消息本体 | **必须用 Python** | ❌ SQL 看不到 |
+
+第三层的关键：`messages` 是 `list[BaseMessage]`，按 7.1 的规则进了 `checkpoint_blobs`，存成 msgpack 二进制。psql 里 `select blob` 只会看到 `\x8dabc4a4b1...` 这种十六进制。
+
+### 8.2 进库的三种方式
+
+**PowerShell：**
+
+```powershell
+docker exec -it pg-langchain psql -U postgres -d langchain
+```
+
+**Git Bash：** 要加 `winpty`，否则报 `the input device is not a TTY`
 
 ```bash
-# 有几个会话，各自多少条 checkpoint
-docker exec pg-langchain psql -U postgres -d langchain \
-  -c "select thread_id, count(*) from checkpoints group by thread_id order by 2 desc;"
+winpty docker exec -it pg-langchain psql -U postgres -d langchain
+```
 
-# 看某会话的快照链
-docker exec pg-langchain psql -U postgres -d langchain \
-  -c "select checkpoint_id, parent_checkpoint_id, metadata->>'step' as step from checkpoints where thread_id='demo-user-1' order by checkpoint_id;"
+**不进交互、只跑一条（写脚本时用这个）：**
 
-# 各表体量
-docker exec pg-langchain psql -U postgres -d langchain -c "
-select 'checkpoints' t, count(*) from checkpoints
-union all select 'blobs', count(*) from checkpoint_blobs
-union all select 'writes', count(*) from checkpoint_writes;"
+```powershell
+docker exec pg-langchain psql -U postgres -d langchain -c "\dt"
+```
 
-# 表和索引占多少空间
-docker exec pg-langchain psql -U postgres -d langchain \
-  -c "select relname, pg_size_pretty(pg_total_relation_size(relid)) from pg_catalog.pg_statio_user_tables;"
+### 8.3 看表结构
+
+#### psql 元命令
+
+```sql
+\dt              -- 当前库所有表
+\dt+             -- 带表大小
+\d checkpoints   -- 单表结构（列、类型、索引）
+\d+ checkpoints  -- 带注释和存储参数
+\di              -- 所有索引
+\dn              -- 所有 schema
+\dv              -- 所有视图
+\l               -- 所有数据库
+\du              -- 所有用户
+\q               -- 退出
+```
+
+#### 用 SQL 查（可脚本化、可导出、可 diff）
+
+```sql
+-- 全部列定义
+select table_name, column_name, data_type, is_nullable, column_default
+from information_schema.columns
+where table_schema = 'public'
+order by table_name, ordinal_position;
+
+-- 全部索引
+select tablename, indexname, indexdef
+from pg_indexes
+where schemaname = 'public';
+
+-- 表和索引占多少磁盘
+select relname,
+       pg_size_pretty(pg_total_relation_size(relid)) as total
+from pg_statio_user_tables
+order by pg_total_relation_size(relid) desc;
+```
+
+#### 导出 schema 文件
+
+```powershell
+docker exec pg-langchain pg_dump -U postgres -d langchain --schema-only > schema.sql
+```
+
+生成完整 `CREATE TABLE` / `CREATE INDEX`，适合存进笔记或做版本对比。**升级 `langgraph-checkpoint-postgres` 后可以用它 diff schema 变化。**
+
+### 8.4 看数据（SQL 能读的部分）
+
+#### ① 有哪些会话
+
+```sql
+select thread_id, count(*) as snapshots
+from checkpoints
+group by thread_id
+order by 2 desc;
+```
+
+本机实测（跑过 notebook 里的两轮对话后）：
+
+```
+ thread_id | snapshots
+-----------+-----------
+ 1         |         6
+```
+
+6 条的意思：`step=-1` 输入 + 模型/工具各步，两轮对话一共推了 6 次快照。
+
+#### ② 快照链（信息量最大的一张表）
+
+```sql
+select checkpoint_id,
+       metadata->>'step'   as step,
+       metadata->>'source' as source,
+       parent_checkpoint_id
+from checkpoints
+where thread_id = '1'
+order by checkpoint_id;
+```
+
+实测输出：
+
+```
+            checkpoint_id             | step | source |         parent
+--------------------------------------+------+--------+------------------------
+ 1f1ca090-066b-6559-bfff-7ecaae5a72a4 | -1   | input  |
+ 1f1ca090-066f-6095-8000-59b57bfe0b7b |    0 | loop   | 1f1ca090-066b-6559-...
+ 1f1ca090-136e-67c2-8001-53c4e5b27c37 |    1 | loop   | 1f1ca090-066f-6095-...
+ 1f1ca090-1385-66e5-8002-5e82636e1fc4 |    2 | input  | 1f1ca090-136e-67c2-...
+ 1f1ca090-1387-6f01-8003-00b23413d8d5 |    3 | loop   | 1f1ca090-1385-66e5-...
+ 1f1ca090-23ce-6c87-8004-5828ff3a0e96 |    4 | loop   | 1f1ca090-1387-6f01-...
+```
+
+读法：
+
+- `step = -1` + `source = input`：刚收到用户输入，还没执行
+- `step = 0,1,...` + `source = loop`：图循环的一步
+- `parent_checkpoint_id` 串成链 → 这就是"可回溯任意历史状态"的物理实现
+
+#### ③ 某个快照的完整 JSON
+
+```sql
+select jsonb_pretty(checkpoint)
+from checkpoints
+where thread_id = '1'
+order by checkpoint_id desc
+limit 1;
+```
+
+会看到 `channel_values`（只有基本类型在这）、`channel_versions`、`versions_seen`、`updated_channels`。
+
+#### ④ blob 的通道和大小（不要 select blob 本体）
+
+```sql
+select channel, version, type, length(blob) as bytes
+from checkpoint_blobs
+where thread_id = '1'
+order by version;
+```
+
+实测输出：
+
+```
+  channel  |              version               |  type   | bytes
+-----------+------------------------------------+---------+-------
+ __start__ | 00000000000000000000000000000001.0 | msgpack |   165
+ messages  | 00000000000000000000000000000002.0 | msgpack |   192
+ messages  | 00000000000000000000000000000003.0 | msgpack |  1402
+ __start__ | 00000000000000000000000000000004.0 | msgpack |   171
+ messages  | 00000000000000000000000000000005.0 | msgpack |  1599
+ messages  | 00000000000000000000000000000006.0 | msgpack |  3345
+```
+
+**看 `messages` 那列：192 → 1402 → 1599 → 3345。** 每次写的是**完整列表**，不是增量。这就是长对话下 checkpoint 表膨胀很快的直接证据，也是后面做存储优化时最先要动的地方。
+
+#### ⑤ pending writes
+
+```sql
+select channel, type, count(*)
+from checkpoint_writes
+where thread_id = '1'
+group by 1, 2;
+```
+
+#### ⑥ 各表体量
+
+```sql
+select 'checkpoints' as t, count(*) from checkpoints
+union all select 'blobs',  count(*) from checkpoint_blobs
+union all select 'writes', count(*) from checkpoint_writes;
+```
+
+### 8.5 看对话内容（必须用 Python）
+
+SQL 到此为止。消息本体是 msgpack，只有在 Python 里反序列化才能变成 `HumanMessage` / `AIMessage` 对象。
+
+#### 方式 1：`get_state`（手上已有编译好的 agent）
+
+```python
+config = {"configurable": {"thread_id": "1"}}
+state = agent.get_state(config)
+
+for m in state.values["messages"]:
+    print(f"{type(m).__name__}: {m.content}")
+```
+
+#### 方式 2：`get_tuple`（不依赖 agent，直接读库）
+
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+
+DB_URI = "postgresql://postgres:postgres@127.0.0.1:5432/langchain"
+
+with PostgresSaver.from_conn_string(DB_URI) as cp:
+    t = cp.get_tuple({"configurable": {"thread_id": "1"}})
+
+    print("checkpoint_id:", t.config["configurable"]["checkpoint_id"])
+    print("metadata:", t.metadata)
+    print("channels:", list(t.checkpoint["channel_values"].keys()))
+
+    for m in t.checkpoint["channel_values"]["messages"]:
+        print(f"{type(m).__name__}: {m.content}")
+```
+
+实测输出（thread `'1'`，两轮对话）：
+
+```
+checkpoint_id: 1f1ca090-23ce-6c87-8004-5828ff3a0e96
+metadata: {'step': 4, 'source': 'loop', 'parents': {}}
+channels: ['messages']
+HumanMessage: '你好我是江来'
+AIMessage: '你好，江来！很高兴认识你。我是AI助手，有什么我可以帮你的吗？'
+HumanMessage: '你知道我说谁吗？'
+AIMessage: '你刚才说自己叫"江来"，所以我目前只能知道"你自称江来"...'
+```
+
+`get_tuple()` 内部做的事就是 7.1 里那段"JSONB 基本类型 + blobs 复杂类型"的合并，再反序列化。**这是"用代码看数据库"的正确姿势。**
+
+#### 方式 3：遍历某会话的全部历史快照
+
+```python
+with PostgresSaver.from_conn_string(DB_URI) as cp:
+    for t in cp.list({"configurable": {"thread_id": "1"}}):
+        msgs = t.checkpoint["channel_values"].get("messages", [])
+        print(t.metadata["step"], t.metadata["source"], f"messages={len(msgs)}")
+```
+
+`cp.list()` 按 `checkpoint_id` 倒序返回，加 `limit=N` 只取最近 N 条。适合排查"第几步之后状态错了"。
+
+#### 方式 4：读指定历史版本
+
+```python
+config = {
+    "configurable": {
+        "thread_id": "1",
+        "checkpoint_id": "1f1ca090-066f-6095-8000-59b57bfe0b7b",  # 想回看的那个
+    }
+}
+
+with PostgresSaver.from_conn_string(DB_URI) as cp:
+    t = cp.get_tuple(config)
+    for m in t.checkpoint["channel_values"]["messages"]:
+        print(f"{type(m).__name__}: {m.content}")
+```
+
+**这是 LangGraph "时间旅行"能力的基础**：指定 `checkpoint_id` 就能拿到那一刻的完整状态。
+
+### 8.6 为什么 blob 看不懂
+
+```sql
+select blob from checkpoint_blobs where thread_id='1' limit 1;
+```
+
+输出 `\x8dabc4a4b1...`。这是 **msgpack 编码的 `BaseMessage` 对象**——不是加密，是二进制序列化格式。
+
+只有两条路：
+
+1. **用 Python 反序列化**（8.5 的方式 2/3，推荐）
+2. 在 SQL 里解码——不现实，msgpack 不是 PG 原生格式
+
+结论：**想知道状态，别去查库，用 `get_state` / `get_tuple`。数据库是给程序读的，不是给人读的。** 只有在排查"到底有没有写进去""写了多少"这类问题时才需要直接看表。
+
+#### 中文乱码
+
+Windows 控制台默认编码是 GBK，Python 打印中文可能变 `???` 或乱码。跑之前先设：
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+```
+
+或者在 Git Bash 里：
+
+```bash
+export PYTHONIOENCODING=utf-8
+```
+
+也可以用一次性命令：
+
+```powershell
+python -X utf8 your_script.py
+```
+
+### 8.7 查询速查
+
+```powershell
+# 一条命令看全：表 + 会话数 + blob 大小
+docker exec pg-langchain psql -U postgres -d langchain -c "\dt+" -c "select thread_id, count(*) from checkpoints group by 1;" -c "select channel, type, length(blob) from checkpoint_blobs order by version limit 10;"
+
+# 某会话的快照链
+docker exec pg-langchain psql -U postgres -d langchain -c "select checkpoint_id, metadata->>'step' as step, metadata->>'source' as source from checkpoints where thread_id='1' order by checkpoint_id;"
+
+# 导出 schema
+docker exec pg-langchain pg_dump -U postgres -d langchain --schema-only > schema.sql
+
+# 导出全部数据
+docker exec pg-langchain pg_dump -U postgres -d langchain > backup.sql
 ```
 
 ---
 
-## 八、三个层次的持久化实验
+## 九、三个层次的持久化实验
 
 **做完这一节，你才算真的理解 checkpoint 存在哪。** 建议按顺序做，每步都观察。
 
@@ -957,7 +1263,7 @@ config_b = {"configurable": {"thread_id": "bob"}}
 
 ---
 
-## 九、排错手册
+## 十、排错手册
 
 按症状查。
 
@@ -979,7 +1285,7 @@ config_b = {"configurable": {"thread_id": "bob"}}
 
 ---
 
-## 十、日常运维速查
+## 十一、日常运维速查
 
 ```bash
 # —— 生命周期 ——
@@ -1022,7 +1328,7 @@ docker system prune -a --volumes   # ⚠️ 连卷一起删，谨慎
 
 ---
 
-## 十一、速查卡片
+## 十二、速查卡片
 
 ```
 连接串      postgresql://postgres:postgres@127.0.0.1:5432/langchain
@@ -1039,6 +1345,29 @@ docker system prune -a --volumes   # ⚠️ 连卷一起删，谨慎
 3. 第一次用必跑 `setup()`；升级依赖后重跑
 4. 连接池必须给 `autocommit=True` 和 `row_factory=dict_row`
 5. 数据在卷里，不在容器里——这是持久化的全部真相
+
+**查看数据记三层：**
+
+```
+结构    \dt / \d+ / information_schema            ← 有哪些表
+元数据  select ... from checkpoints               ← 几个会话、几步、大小
+内容    get_state() / get_tuple()   ← 必须用 Python，blob 是 msgpack
+```
+
+**最常用的三条查看命令：**
+
+```powershell
+# 1. 有哪些会话
+docker exec pg-langchain psql -U postgres -d langchain -c "select thread_id, count(*) from checkpoints group by 1;"
+
+# 2. 某会话的快照链
+docker exec pg-langchain psql -U postgres -d langchain -c "select checkpoint_id, metadata->>'step' as step, metadata->>'source' as source from checkpoints where thread_id='1' order by checkpoint_id;"
+
+# 3. 看真实对话（Python，-X utf8 避免中文乱码）
+python -X utf8 -c "from langgraph.checkpoint.postgres import PostgresSaver; DB='postgresql://postgres:postgres@127.0.0.1:5432/langchain'; cm=PostgresSaver.from_conn_string(DB); cp=cm.__enter__(); print([m.content for m in cp.get_tuple({'configurable':{'thread_id':'1'}}).checkpoint['channel_values']['messages']])"
+```
+
+> 注意第 3 条里 `cm` 必须留着引用。只写 `cp = PostgresSaver.from_conn_string(DB).__enter__()` 会因为上下文管理器被 GC 回收而立刻关掉连接，报 `OperationalError: the connection is closed`。
 
 **一个问题自测**（能答上来就算搞懂了）：
 
